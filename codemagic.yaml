@@ -5,44 +5,49 @@ workflows:
 
     environment:
       groups:
-        - signing            # CERTIFICATE_P12, CERTIFICATE_PASSWORD, MOBILEPROVISION
-        - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
+        - signing
+        - appstore_connect
       vars:
-        XCODE_PROJECT: "Finance-Regret-Manager.xcodeproj"   # или задай XCODE_WORKSPACE вместо XCODE_PROJECT
+        XCODE_PROJECT: "Finance-Regret-Manager.xcodeproj"
         XCODE_SCHEME: "Finance-Regret-Manager"
         BUNDLE_ID: "com.financeregret.denys1er"
-        TEAM_ID: "OVERRIDE_BY_PROFILE"        # заменится значением из профиля
+        TEAM_ID: "OVERRIDE_BY_PROFILE"
         EXPORT_METHOD: "app-store"
-        # APP_VERSION: "1.1"                  # ← опционально, если хочешь поднять маркетинговую версию
-        # APP_BUILD: "123"                    # ← опционально, если хочешь задать build вручную (иначе timestamp)
 
     scripts:
       - name: Import certificate and provisioning profile
         script: |
           set -euo pipefail
 
-          # --- Подхватываем секреты с разными именами (оба варианта поддержаны) ---
+          # --- Secrets (support alternate names) ---
           CERT_P12_B64="${CERTIFICATE_P12:-${CERT_P12:-}}"
           CERT_PWD="${CERTIFICATE_PASSWORD:-${CERT_PASSWORD:-}}"
           PROFILE_B64="${MOBILEPROVISION:-${PROFILE_MOBILEPROVISION:-}}"
 
-          # Проверки с понятными сообщениями
-          [ -n "$CERT_P12_B64" ] || { echo "❌ Missing CERTIFICATE_P12 (или CERT_P12) в группе 'signing' — это base64 вашего .p12"; exit 1; }
-          [ -n "$PROFILE_B64" ]  || { echo "❌ Missing MOBILEPROVISION (или PROFILE_MOBILEPROVISION) — это base64 вашего .mobileprovision (App Store)"; exit 1; }
+          [ -n "$CERT_P12_B64" ] || { echo "❌ Missing CERTIFICATE_P12 (or CERT_P12)"; exit 1; }
+          [ -n "$PROFILE_B64" ]  || { echo "❌ Missing MOBILEPROVISION (or PROFILE_MOBILEPROVISION)"; exit 1; }
+          [ -n "${CERT_PWD:-}" ] || { echo "❌ Missing CERTIFICATE_PASSWORD (or CERT_PASSWORD)"; exit 1; }
 
-          # Files from secrets
-          echo "$CERT_P12_B64" | base64 --decode > cert.p12
-          echo "$PROFILE_B64"  | base64 --decode > profile.mobileprovision
+          # --- Robust base64 decode for macOS runners ---
+          b64dec() { (base64 --decode 2>/dev/null || base64 -D); }
 
-          # Keychain + certificate
+          printf "%s" "$CERT_P12_B64" | tr -d '\r' | b64dec > cert.p12
+          printf "%s" "$PROFILE_B64"  | tr -d '\r' | b64dec > profile.mobileprovision
+
+          # --- Diagnostics BEFORE import (safe) ---
+          echo "== cert.p12 diagnostics =="
+          ls -lah cert.p12
+          file cert.p12 || true
+          echo "bytes: $(wc -c < cert.p12 || true)"
+
+          echo "== Validate pkcs12 readability =="
+          openssl pkcs12 -info -in cert.p12 -noout -passin pass:"$CERT_PWD"
+
+          # --- Keychain + certificate ---
           keychain initialize
-          if [ -n "$CERT_PWD" ]; then
-            keychain add-certificates --certificate cert.p12 --certificate-password "$CERT_PWD"
-          else
-            keychain add-certificates --certificate cert.p12
-          fi
+          keychain add-certificates --certificate cert.p12 --certificate-password "$CERT_PWD"
 
-          # Install profile and extract UUID + TeamIdentifier
+          # --- Install profile and extract UUID + TeamIdentifier ---
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           PROFILE_PLIST="$(security cms -D -i profile.mobileprovision)"
           PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin <<< "$PROFILE_PLIST")
@@ -56,8 +61,8 @@ workflows:
           echo "PROFILE_UUID=$PROFILE_UUID" >> "$CM_ENV"
           echo "TEAM_ID=$PROFILE_TEAM_ID"   >> "$CM_ENV"
 
-          # Resolve correct signing identity (Apple Distribution или iPhone Distribution)
-          DIST_IDENTITY=$(security find-identity -v -p codesigning | sed -nE 's/.*"((Apple|iPhone) Distribution:.*)"/\1/p' | head -n1 || true)
+          # Resolve signing identity
+          DIST_IDENTITY="$(security find-identity -v -p codesigning | sed -nE 's/.*"((Apple|iPhone) Distribution:.*)"/\1/p' | head -n1 || true)"
           if [ -z "$DIST_IDENTITY" ]; then
             echo "❌ Distribution identity not found in keychain"
             security find-identity -v -p codesigning || true
@@ -66,10 +71,10 @@ workflows:
           echo "DIST_IDENTITY=$DIST_IDENTITY" >> "$CM_ENV"
           echo "Using signing identity: $DIST_IDENTITY"
 
-          # Diagnostics
-          echo "== Code signing identities in keychain =="; security find-identity -v -p codesigning || true
+          echo "== Code signing identities in keychain =="
+          security find-identity -v -p codesigning || true
 
-          # exportOptions.plist (manual)
+          # --- exportOptions.plist (manual) ---
           cat > exportOptions.plist <<EOI
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -92,15 +97,13 @@ workflows:
           # Apply profile into the project (manual signing)
           xcode-project use-profiles --project "$XCODE_PROJECT" --export-options-plist exportOptions.plist
 
-      - name: "Prepare versions (no Info.plist)"
+      - name: Prepare versions (no Info.plist)
         script: |
           set -euo pipefail
 
-          # Всегда новый build; можно переопределить APP_BUILD в UI
           BUILD_NUM="${APP_BUILD:-$(date +%y%j%H%M%S)}"
           echo "BUILD_NUM=$BUILD_NUM" >> "$CM_ENV"
 
-          # APP_VERSION берётся из UI (если нужна смена маркетинговой версии)
           if [ -n "${APP_VERSION:-}" ]; then
             echo "APP_VERSION=$APP_VERSION" >> "$CM_ENV"
           fi
@@ -109,12 +112,13 @@ workflows:
           echo "MARKETING_VERSION=${APP_VERSION:-(unchanged)}"
           echo "CURRENT_PROJECT_VERSION=$BUILD_NUM"
 
-      - name: "Archive and export IPA (xcodebuild)"
+      - name: Archive and export IPA (xcodebuild)
         script: |
+          set -euo pipefail
+
           ARCHIVE_PATH="$CM_BUILD_DIR/Finance-Regret-Manager.xcarchive"
           EXPORT_PATH="$CM_EXPORT_DIR"
 
-          # Доп. флаги версий прямо в xcodebuild (работает без Info.plist)
           EXTRA_FLAGS=( CURRENT_PROJECT_VERSION="$BUILD_NUM" )
           if [ -n "${APP_VERSION:-}" ]; then
             EXTRA_FLAGS+=( MARKETING_VERSION="$APP_VERSION" )
