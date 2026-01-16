@@ -30,9 +30,31 @@ workflows:
           [ -n "$CERT_P12_B64" ] || { echo "❌ Missing CERTIFICATE_P12 (или CERT_P12) в группе 'signing' — это base64 вашего .p12"; exit 1; }
           [ -n "$PROFILE_B64" ]  || { echo "❌ Missing MOBILEPROVISION (или PROFILE_MOBILEPROVISION) — это base64 вашего .mobileprovision (App Store)"; exit 1; }
 
-          # Files from secrets
-          echo "$CERT_P12_B64" | base64 --decode > cert.p12
-          echo "$PROFILE_B64"  | base64 --decode > profile.mobileprovision
+          # Files from secrets (SAFE decode: no echo!)
+          printf '%s' "$CERT_P12_B64" | base64 --decode > cert.p12
+          printf '%s' "$PROFILE_B64"  | base64 --decode > profile.mobileprovision
+
+          # === DEBUG (before keychain import) ===
+          echo "=== DEBUG cert.p12 ==="
+          ls -l cert.p12 || true
+          wc -c cert.p12 || true
+          file cert.p12 || true
+          shasum -a 256 cert.p12 || true
+          xxd -l 32 cert.p12 || true
+
+          echo "=== DEBUG profile.mobileprovision ==="
+          ls -l profile.mobileprovision || true
+          wc -c profile.mobileprovision || true
+          file profile.mobileprovision || true
+          shasum -a 256 profile.mobileprovision || true
+
+          echo "=== DEBUG openssl pkcs12 parse ==="
+          if [ -n "$CERT_PWD" ]; then
+            openssl pkcs12 -in cert.p12 -info -noout -passin pass:"$CERT_PWD"
+          else
+            # если пароль пустой (редко), пробуем без него
+            openssl pkcs12 -in cert.p12 -info -noout -passin pass:
+          fi
 
           # Keychain + certificate
           keychain initialize
