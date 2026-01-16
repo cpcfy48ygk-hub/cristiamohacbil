@@ -8,33 +8,27 @@ workflows:
         - signing            # CERTIFICATE_P12, CERTIFICATE_PASSWORD, MOBILEPROVISION
         - appstore_connect   # APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
       vars:
-        XCODE_PROJECT: "Finance-Regret-Manager.xcodeproj"   # или задай XCODE_WORKSPACE вместо XCODE_PROJECT
+        XCODE_PROJECT: "Finance-Regret-Manager.xcodeproj"
         XCODE_SCHEME: "Finance-Regret-Manager"
         BUNDLE_ID: "com.financeregret.denys1er"
-        TEAM_ID: "OVERRIDE_BY_PROFILE"        # заменится значением из профиля
+        TEAM_ID: "OVERRIDE_BY_PROFILE"
         EXPORT_METHOD: "app-store"
-        # APP_VERSION: "1.1"                  # ← опционально, если хочешь поднять маркетинговую версию
-        # APP_BUILD: "123"                    # ← опционально, если хочешь задать build вручную (иначе timestamp)
 
     scripts:
       - name: Import certificate and provisioning profile
         script: |
           set -euo pipefail
 
-          # --- Подхватываем секреты с разными именами (оба варианта поддержаны) ---
           CERT_P12_B64="${CERTIFICATE_P12:-${CERT_P12:-}}"
           CERT_PWD="${CERTIFICATE_PASSWORD:-${CERT_PASSWORD:-}}"
           PROFILE_B64="${MOBILEPROVISION:-${PROFILE_MOBILEPROVISION:-}}"
 
-          # Проверки с понятными сообщениями
           [ -n "$CERT_P12_B64" ] || { echo "❌ Missing CERTIFICATE_P12 (или CERT_P12) в группе 'signing' — это base64 вашего .p12"; exit 1; }
           [ -n "$PROFILE_B64" ]  || { echo "❌ Missing MOBILEPROVISION (или PROFILE_MOBILEPROVISION) — это base64 вашего .mobileprovision (App Store)"; exit 1; }
 
-          # Files from secrets (SAFE decode: no echo!)
           printf '%s' "$CERT_P12_B64" | base64 --decode > cert.p12
           printf '%s' "$PROFILE_B64"  | base64 --decode > profile.mobileprovision
 
-          # === DEBUG (before keychain import) ===
           echo "=== DEBUG cert.p12 ==="
           ls -l cert.p12 || true
           wc -c cert.p12 || true
@@ -55,23 +49,26 @@ workflows:
             openssl pkcs12 -in cert.p12 -info -noout -passin pass:
           fi
 
-          # Keychain + certificate (manual import to bypass codemagic-cli-tools)
+          # Keychain + certificate (manual import, no set-keychain-settings)
           KEYCHAIN_PATH="$HOME/Library/Keychains/codemagic_signing.keychain-db"
           KEYCHAIN_PASSWORD="cm_temp_keychain_pass"
 
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" || true
-          security set-keychain-settings -lut 0 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
+          # Ensure keychain is in search list + default
+          security list-keychains -d user || true
           security list-keychains -d user -s "$KEYCHAIN_PATH"
           security default-keychain -d user -s "$KEYCHAIN_PATH"
 
+          # Import p12
           if [ -n "$CERT_PWD" ]; then
             security import cert.p12 -k "$KEYCHAIN_PATH" -P "$CERT_PWD" -A
           else
             security import cert.p12 -k "$KEYCHAIN_PATH" -A
           fi
 
+          # Allow codesign to use the key in CI
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" || true
 
           echo "== Code signing identities in manual keychain =="
@@ -87,11 +84,9 @@ workflows:
           echo "Using Provisioning Profile UUID: $PROFILE_UUID"
           echo "TeamIdentifier from profile: $PROFILE_TEAM_ID"
 
-          # export to env for next steps
           echo "PROFILE_UUID=$PROFILE_UUID" >> "$CM_ENV"
           echo "TEAM_ID=$PROFILE_TEAM_ID"   >> "$CM_ENV"
 
-          # Resolve correct signing identity (Apple Distribution или iPhone Distribution)
           DIST_IDENTITY=$(security find-identity -v -p codesigning | sed -nE 's/.*"((Apple|iPhone) Distribution:.*)"/\1/p' | head -n1 || true)
           if [ -z "$DIST_IDENTITY" ]; then
             echo "❌ Distribution identity not found in keychain"
@@ -101,10 +96,8 @@ workflows:
           echo "DIST_IDENTITY=$DIST_IDENTITY" >> "$CM_ENV"
           echo "Using signing identity: $DIST_IDENTITY"
 
-          # Diagnostics
           echo "== Code signing identities in keychain =="; security find-identity -v -p codesigning || true
 
-          # exportOptions.plist (manual)
           cat > exportOptions.plist <<EOI
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -124,22 +117,16 @@ workflows:
           EOI
           /usr/bin/plutil -lint exportOptions.plist
 
-          # Apply profile into the project (manual signing)
           xcode-project use-profiles --project "$XCODE_PROJECT" --export-options-plist exportOptions.plist
 
       - name: "Prepare versions (no Info.plist)"
         script: |
           set -euo pipefail
-
-          # Всегда новый build; можно переопределить APP_BUILD в UI
           BUILD_NUM="${APP_BUILD:-$(date +%y%j%H%M%S)}"
           echo "BUILD_NUM=$BUILD_NUM" >> "$CM_ENV"
-
-          # APP_VERSION берётся из UI (если нужна смена маркетинговой версии)
           if [ -n "${APP_VERSION:-}" ]; then
             echo "APP_VERSION=$APP_VERSION" >> "$CM_ENV"
           fi
-
           echo "== Planned versions =="
           echo "MARKETING_VERSION=${APP_VERSION:-(unchanged)}"
           echo "CURRENT_PROJECT_VERSION=$BUILD_NUM"
@@ -149,7 +136,6 @@ workflows:
           ARCHIVE_PATH="$CM_BUILD_DIR/Finance-Regret-Manager.xcarchive"
           EXPORT_PATH="$CM_EXPORT_DIR"
 
-          # Доп. флаги версий прямо в xcodebuild (работает без Info.plist)
           EXTRA_FLAGS=( CURRENT_PROJECT_VERSION="$BUILD_NUM" )
           if [ -n "${APP_VERSION:-}" ]; then
             EXTRA_FLAGS+=( MARKETING_VERSION="$APP_VERSION" )
