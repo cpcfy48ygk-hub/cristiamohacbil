@@ -52,17 +52,30 @@ workflows:
           if [ -n "$CERT_PWD" ]; then
             openssl pkcs12 -in cert.p12 -info -noout -passin pass:"$CERT_PWD"
           else
-            # если пароль пустой (редко), пробуем без него
             openssl pkcs12 -in cert.p12 -info -noout -passin pass:
           fi
 
-          # Keychain + certificate
-          keychain initialize
+          # Keychain + certificate (manual import to bypass codemagic-cli-tools)
+          KEYCHAIN_PATH="$HOME/Library/Keychains/codemagic_signing.keychain-db"
+          KEYCHAIN_PASSWORD="cm_temp_keychain_pass"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" || true
+          security set-keychain-settings -lut 0 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security default-keychain -d user -s "$KEYCHAIN_PATH"
+
           if [ -n "$CERT_PWD" ]; then
-            keychain add-certificates --certificate cert.p12 --certificate-password "$CERT_PWD"
+            security import cert.p12 -k "$KEYCHAIN_PATH" -P "$CERT_PWD" -A
           else
-            keychain add-certificates --certificate cert.p12
+            security import cert.p12 -k "$KEYCHAIN_PATH" -A
           fi
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" || true
+
+          echo "== Code signing identities in manual keychain =="
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" || true
 
           # Install profile and extract UUID + TeamIdentifier
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
